@@ -12,9 +12,40 @@ Die Funktion soll eine Liste mit Einträgen `model` und `data` zurückliefern:
 
 a) *First, understand the problem. Then, write the code.* Skizzieren Sie zunächst in Pseudo-Code wie der RANSAC Algorithmus in Einzelschritte und Sub-Funktionen zergliedert werden kann. Definieren Sie sauber was jeweils die Inputs und Outputs dieser Sub-Funktionen sein sollen. Gehen Sie hier iterativ vor -- verfeinern Sie sukzessive die grobe Untergliederung in kleinere Teilschritte. 
 
+Mein erster Entwurf sah wie folgt aus:
+```
+ransaclm <- function(formula, data, error_threshold, inlier_threshold, iterations=100, seed) {
+  init_ransac()
+  for (i in seq_len(iterations)) {
+    current_sample <- select_inliers()
+    current_model <- find_model()
+    inliers <- find_inliers()
+    if (many_inliers()) {
+      better_model <- find_model()
+      current_error <- extract_error()
+      if (obtained_better_fit()) {
+        save_new_model()
+      }
+    } 
+  }
+}
+```
+In der `init_ransac`-Funktion würden wir hier diverse Variablen deklarieren, die im späteren Verlauf gebraucht werden. Dann wiederholen wir `iterations`-mal:
+- `select_inliers`, um zufällig eine passende Anzahl an Beobachtungen zu ziehen
+- mit diesen kann dann ein Modell gefittet werden (`find_model()`)
+- anschließend werden weitere Inlier gefunden, die von diesem Modell gut gefittet werden
+- falls es viele Inlier gibt, dann fitten wir ein neues Modell und schauen, ob es den overall fit verbessert.
+
 - Denken Sie defensiv: Was könnte schiefgehen, wie gehen Sie sinnvoll damit um? Stichworte: Untaugliche Argumente, Daten mit fehlenden Werten, Faktorvariablen, lineare Modelle mit "$p > n$", etc....
+
+Grundsätzlich können wir die Datentypen der Inputs checken. Außerdem sollte der Dataframe nur für die lm-Funktion passende Datentypen beinhalten und keine fehlenden Werte aufweisen. Die übergebene Formel sollte natürlich nur Kovariablen enthalten, die auch im Dataframe vorkommen. Um sicherzustellen, dass das lineare Modell nicht unterspezifiziert ist, brauchen wir mehr Beobachtungen als Kovariablen. All diese Dinge können über Assertions abgesichert werden.
+
+Das reicht aber noch nicht, denn durch das Sampling kann es passieren, dass wir z. B. mehrfach vorkommende Beobachtungen aus dem Dataframe samplen. Falls wir Pech haben, bekommen wir so wieder ein unterspezifiziertes Modell. Da dies viele verschiedene Gründe haben kann, die nicht einfach im Vorfeld zu testen sind, macht hier ein tryCatch-Block Sinn.
+
 - Denken Sie parallel: Wie können Sie diesen Algorithmus am besten (plattformunabhängig) parallelisieren? 
 (Welches Paket -- `{future.apply}`, `{foreach}` + `{do??}`, `{parallel}` -- Sie für die Parallelisierung benutzen bleibt Ihnen überlassen.)
+
+Das wesentliche Problem war hier die Speicherung des "besten" Modells. Im sequentiellen Fall kann man einfach nach jeder Iteration checken, ob der Error kleiner geworden ist. Ich glaube das geht parallelisiert nicht (das aktuell beste Modell kann sich ändern, während ein Thread diesen Check macht). Ich habe daher einfach eine Liste mit den Ergebnissen aus jeder Iteration zurückgegeben und hinterher geschaut, bei welchem Modell der Error minimal war - das ist vergleichsweise sehr ineffizient (gegebenenfalls speichert man sehr viele, evtl. auch große Modelle) - man könnte vielleicht das beste Modell pro Core speichern und das dann am Schluss vergleichen, aber ich wusste nicht wie / ob das geht. Ich denke das würde bei mir sämtliche Laufzeitvorteile aus der Parallelisierung auch wieder zunichte machen.
 
 b) Implementieren Sie Ihren Entwurf aus a).
 
@@ -25,9 +56,6 @@ c) Überprüfen Sie Ihre Implementation (auch) mit dem untenstehenden Testcode a
 Code der für erwartbare Fehler und ungeeignete Inputs informative Fehlermeldungen und Warnungen produziert.**
 
 -----
-
-```{r, echo = FALSE, code = readLines("ransac-def.R")}
-```
 
 #### Testcode:
 
