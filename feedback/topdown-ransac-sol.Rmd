@@ -1,0 +1,181 @@
+```{r, child = "topdown-ransac-ex.Rmd"}
+```
+
+-------------
+
+## Lösung:
+
+
+Die folgenden Funktionen implementiert das gewünschte:
+
+```{r, code = readLines("ransac-def.R")}
+```
+
+S. ganz unten für eine rein sequentielle, nicht parallelisierte Implementation 
+die sich stärker an dem Pseudo-Code in Wikipedia orientiert.
+
+Parallelisierung bringt hier erst bei recht großen Datensätzen Zeitvorteile:
+
+```r
+data_big <- make_ransac_data(n_obs = 10000, n_coef = 10, inlier_fraction = 0.7)
+rbenchmark::benchmark(
+  seq = {
+    future::plan("sequential")
+    ransaclm(y ~ . - inlier, data = data_big, 
+             error_threshold = 2,  inlier_threshold = 5000)
+  },
+  par = {
+    future::plan("multicore", workers = 20)
+    ransaclm(y ~ . - inlier, data = data_big, 
+             error_threshold = 2,  inlier_threshold = 5000)
+  }
+)
+#  test replications elapsed relative user.self sys.self user.child sys.child
+#2  par          100  68.319    1.000    41.161   19.956    182.699    68.478
+#1  seq          100 143.945    2.107   143.834    0.105      0.000     0.000
+```
+
+Weitere Tests:
+```{r, ransac_test_advanced, error =TRUE,fig.width = 6, fig.height = 4}
+# immer set.seed() um Ergebnisse reproduzierbar zu machen...
+set.seed(12122)
+data_simple <- make_ransac_data(100, 1, inlier_fraction = 0.7)
+
+# inlier_threshold zu hoch --> checke warnung & erwartetes Rückgabeobjekt
+testthat::expect_warning(
+  fail_inlier <- ransaclm(y ~ . - inlier,
+                          data = data_simple, error_threshold = 2,
+                          inlier_threshold = 99, seed = 20161110
+  ))
+testthat::expect_null(fail_inlier$model)
+
+# response mit NAs
+data_simple_nay <- data_simple
+data_simple_nay$y[1:50] <- NA
+ransac_simple_nay <- ransaclm(y ~ . - inlier,
+  data = data_simple_nay, error_threshold = 2,
+  inlier_threshold = 25, seed = 20161110
+)
+validate_ransac(ransac_simple_nay)
+
+# kovariable mit NAs
+data_simple_nax <- data_simple
+data_simple_nax$x[51:100] <- NA
+ransac_simple_nax <- ransaclm(y ~ . - inlier,
+  data = data_simple_nax, error_threshold = 2,
+  inlier_threshold = 25, seed = 20161110
+)
+validate_ransac(ransac_simple_nax)
+
+# multivariat
+set.seed(121221)
+data_multi <- make_ransac_data(500, 3, inlier_fraction = 0.9)
+
+ransac_multi <- ransaclm(y ~ . - inlier,
+  data = data_multi, error_threshold = 1,
+  inlier_threshold = 420, seed = 20161111
+)
+validate_ransac(ransac_multi, plot = FALSE)
+
+# multivariat mit interaktion
+ransac_multi <- ransaclm(y ~ x.1 * x.2 * x.3 - inlier,
+  data = data_multi, error_threshold = 2,
+  inlier_threshold = 400, seed = 20161110
+)
+validate_ransac(ransac_multi, plot = FALSE)
+# --> Modell fehlspezifiziert, dementsprechend schlechte Schätzung
+#     aber outlier-Identifikation noch ok
+
+# factor variable (with true coefficients 0)
+data_factor <- cbind(data_simple, x_factor = gl(4, 25))
+ransac_factor <- ransaclm(y ~ . - inlier,
+  data = data_factor, error_threshold = 2,
+  inlier_threshold = 50, seed = 20161110
+)
+validate_ransac(ransac_factor, plot = FALSE)
+
+# no outliers
+set.seed(12122)
+data_inliers <- data.frame(y = 1:100 + rnorm(100), x = 1:100, inlier = TRUE)
+ransac_inliers <- ransaclm(y ~ . - inlier,
+  data = data_inliers, error_threshold = 3,
+  inlier_threshold = 95, seed = 20161111
+)
+validate_ransac(ransac_inliers, plot = TRUE)
+```
+
+Hinweis: Durch die Formelnotation mit "`- inlier`" bleibt -- in meiner Implementation, zumindest -- die ursprünglich angelegte `inlier`-Variable, welche die wahren *inlier* identifiziert, im Datensatz des Rückgabeobjekts erhalten so dass wir mit `validate_ransac` eine Kreuztabelle der wahren und entdeckten Inlier/Outlier erzeugen können. Wenn `inlier` nicht in der Formel vorkäme würde diese Spalte nicht von `model.frame(model_all)` zurückgeliefert werden.
+
+Alternative, sequentielle Implementation:
+```{r, ransac-def-seq, eval = FALSE}
+#' Fit a random sample consensus (RANSAC) linear model for outlier-contaminated data
+#     Details: https://en.wikipedia.org/wiki/Random_sample_consensus
+#' input: formula: valid lm formula (univariate response only, no offsets)
+#'        data: data.frame containing the variables in formula
+#'        error_threshold: observations with prediction error below this are part of the
+#'          consensus set
+#'        inlier_threshold: minimum size of consensus set
+#'        iterations: how many random draws of candidate sets to try (
+#'          defaults to half the number of observations in data)
+#'        seed: RNG seed
+#' output: list with model (best fit lm-object on consensus set),
+#'   data (modified input data (complete cases), with additional boolean variable
+#'   ".consensus_set" indicating the best set that was found)
+ransaclm <- function(formula, data, error_threshold, inlier_threshold,
+                     iterations = nrow(data) / 2, seed = NULL) {
+  checkmate::assert_class(formula, "formula")
+  checkmate::assert_class(data, "data.frame")
+  checkmate::assert_number(error_threshold, lower = 0)
+  checkmate::assert_integerish(inlier_threshold, lower = 1, upper = nrow(data) - 1)
+  checkmate::assert_count(iterations, positive = TRUE)
+  checkmate::assert_int(seed, null.ok = TRUE, lower = 1)
+
+  if (!is.null(seed)) set.seed(as.integer(seed))
+
+  model_all <- try(lm(formula, data), silent = TRUE)
+  if (inherits(model_all, "try-error")) {
+    stop(
+      "Could not fit specified model on the supplied data, lm exited with error:\n",
+      model_all
+    )
+  }
+  # multivariate response not allowed, easiest way to check is to disallow
+  #   matrix-coefficients
+  if (is.matrix(coefficients(model_all))) {
+    stop("Multivariate response models are not implemented.")
+  }
+  if (!is.null(model_all$offset)) {
+    stop("Models with offset are not implemented.")
+  }
+
+  # model.frame gets rid of incomplete observations in <data>
+  data_all <- model.frame(model_all)
+  design <- model.matrix(model_all)
+  response <- model.response(data_all)
+
+  # initalize with huge error
+  best_error <- Inf
+  best_set <- best_model <- NULL
+
+  for (i in seq_len(iterations)) {
+    candidate_set <- get_candidate_set(design, response, error_threshold)
+    if (length(candidate_set) < inlier_threshold) next
+    candidate_error <- refit_consensus_set(candidate_set,
+      design = design,
+      response = response
+    )
+    if (candidate_error < best_error) {
+      best_error <- candidate_error
+      best_set <- candidate_set
+      best_model <- update(model_all, data = data_all[best_set, ])
+    }
+  }
+  if (is.null(best_set)) {
+    warning("No RANSAC model satisfied criteria, decrease inlier or error tresholds.\n")
+    return(list(model = NULL, data = data_all))
+  }
+  # add consensus_set variable to cleaned input data and return model, modified data
+  data_all$.consensus_set <- 1:nrow(data_all) %in% best_set
+  list(model = best_model, data = data_all)
+}
+```
